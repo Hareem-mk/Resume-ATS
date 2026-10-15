@@ -41,8 +41,13 @@ class ReviewError(Exception):
 def build_quick_crew(resume: str, job: str, api_key: str, model_name: str):
     from crewai import Agent, Crew, LLM, Process, Task
 
+    # Reasoning tokens share the completion budget on GPT-OSS. Low effort
+    # leaves more room for the final JSON without adding automatic API calls.
+    model_options = {}
+    if model_name in ('openai/gpt-oss-120b', 'openai/gpt-oss-20b'):
+        model_options['reasoning_effort'] = 'low'
     llm = LLM(model=f"groq/{model_name}", api_key=api_key, temperature=0.2,
-              max_tokens=4000, timeout=90, max_retries=0)
+              max_tokens=6000, timeout=90, max_retries=0, **model_options)
     llm = apply_groq_compat(llm)
     reviewer = Agent(
         role="Resume Review Specialist",
@@ -61,7 +66,10 @@ def build_quick_crew(resume: str, job: str, api_key: str, model_name: str):
         "Not found in resume. Provide High/Medium/Low actions and truthful rewrites. "
         "Return ONLY valid JSON with these keys and shapes, no Markdown fences: "
         f"{json.dumps(SCHEMA)}. Use at most 30 requirement rows, 6 actions, 3 rewrites, "
-        "and 10 keywords. Do not calculate a score. Keep actions concise.\n"
+        "and 10 keywords. Do not calculate a score. Keep actions concise. "
+        "Use valid JSON double-quoted strings. Escape quotes and newlines inside "
+        "strings. Finish all arrays and the final closing brace. Do not add prose "
+        "before or after the JSON object.\n"
         f"JOB DESCRIPTION DATA:\n<job>\n{job}\n</job>\n"
         f"RESUME DATA:\n<resume>\n{resume}\n</resume>"
     )
@@ -82,13 +90,37 @@ def source_quote(value: str, source: str) -> str | None:
 
 
 def parse_output(output) -> dict:
+    structured = getattr(output, 'json_dict', None)
+    if isinstance(structured, dict) and structured:
+        return structured
     raw = str(getattr(output, "raw", output)).strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I).strip()
+    # Some agent/provider combinations wrap JSON in a Final Answer label,
+    # Markdown fences, or a reasoning block. Remove wrappers, not report facts.
+    raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.S | re.I).strip()
     try:
         data = json.loads(raw)
-    except (ValueError, TypeError) as exc:
-        raise ReviewError("The model returned an incomplete report. Please try again.", type(exc).__name__) from None
+    except json.JSONDecodeError as exc:
+        decoder = json.JSONDecoder()
+        # Require the full report keys when extracting an embedded object, so
+        # a valid nested row inside a cut-off response is never used as a report.
+        required = {'requirements', 'recommendations', 'rewrites', 'ats_keywords'}
+        candidates = []
+        for index, match in enumerate(re.finditer(r'\{', raw)):
+            if index >= 100:
+                break
+            try:
+                candidate, _ = decoder.raw_decode(raw, match.start())
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict) and required.issubset(candidate):
+                candidates.append(candidate)
+        if len(candidates) == 1:
+            return candidates[0]
+        raise ReviewError(
+            'The model did not return a complete, readable JSON report. '
+            'Try a shorter job description or resume.',
+            f'JSONDecodeError; response characters={len(raw)}; error position={exc.pos}'
+        ) from None
     if not isinstance(data, dict):
         raise ReviewError("The model returned an invalid report. Please try again.")
     return data

@@ -1,4 +1,5 @@
 """Stage 2 Quick review. No UI or LLM calls happen during import."""
+from groq_compat imprt apply_groq_compat
 from __future__ import annotations
 
 import json

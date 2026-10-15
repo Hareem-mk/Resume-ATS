@@ -1,4 +1,4 @@
-"""Stage 2 Quick review. No UI or LLM calls happen during import."""
+"""Quick and Detailed review. No UI or LLM calls happen during import."""
 from __future__ import annotations
 
 from groq_compat import apply_groq_compat
@@ -6,6 +6,7 @@ from groq_compat import apply_groq_compat
 import json
 import re
 import time
+from functools import wraps
 
 from runtime import configure_runtime
 
@@ -89,7 +90,7 @@ def source_quote(value: str, source: str) -> str | None:
     return match.group(0) if match else None
 
 
-def parse_output(output) -> dict:
+def parse_output(output, required_keys=None) -> dict:
     structured = getattr(output, 'json_dict', None)
     if isinstance(structured, dict) and structured:
         return structured
@@ -97,13 +98,17 @@ def parse_output(output) -> dict:
     # Some agent/provider combinations wrap JSON in a Final Answer label,
     # Markdown fences, or a reasoning block. Remove wrappers, not report facts.
     raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.S | re.I).strip()
+    fenced = re.fullmatch(r'```(?:json)?\s*(.*?)\s*```', raw, flags=re.S | re.I)
+    if fenced:
+        raw = fenced.group(1)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         decoder = json.JSONDecoder()
         # Require the full report keys when extracting an embedded object, so
         # a valid nested row inside a cut-off response is never used as a report.
-        required = {'requirements', 'recommendations', 'rewrites', 'ats_keywords'}
+        required = (set(required_keys) if required_keys is not None else
+                    {'requirements', 'recommendations', 'rewrites', 'ats_keywords'})
         candidates = []
         for index, match in enumerate(re.finditer(r'\{', raw)):
             if index >= 100:
@@ -268,3 +273,222 @@ def review_quick(resume: str, job: str, api_key: str, model_name: str) -> dict:
                 continue
             raise ReviewError(messages[kind], type(exc).__name__) from None
     raise ReviewError(messages['rate'])
+
+
+# Detailed mode: validate each task before the next agent sees its output.
+def _validated_requirements(data: dict, job: str) -> dict:
+    items = data.get('requirements')
+    if not isinstance(items, list) or not 1 <= len(items) <= 30:
+        raise ReviewError('The job analyst did not return 1–30 requirements. Please try again.')
+    clean, ids, names = [], set(), set()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ReviewError('The job analyst returned an invalid requirement.')
+        ident = item.get('id')
+        name = item.get('requirement')
+        priority = item.get('priority')
+        category = item.get('category')
+        quote = source_quote(str(item.get('job_evidence', '')), job)
+        if (not isinstance(ident, str) or not re.fullmatch(r'R[1-9][0-9]*', ident)
+                or ident in ids or not isinstance(name, str) or not name.strip()
+                or name.strip().casefold() in names
+                or priority not in ('Must-have', 'Nice-to-have')
+                or category not in ('Skill', 'Experience', 'Education', 'Certification', 'Other')
+                or not quote):
+            raise ReviewError('A job requirement could not be verified. No Detailed report was generated.')
+        ids.add(ident)
+        names.add(name.strip().casefold())
+        clean.append({'id': ident, 'requirement': name.strip(), 'priority': priority,
+                      'category': category, 'job_evidence': quote})
+    keywords = data.get('keywords', [])
+    if not isinstance(keywords, list):
+        raise ReviewError('The job analyst returned an invalid keyword list.')
+    return {'requirements': clean,
+            'keywords': [k.strip() for k in keywords[:15] if isinstance(k, str)
+                         and k.strip() and k.strip().casefold() in job.casefold()]}
+
+
+def _validated_evidence(data: dict, requirements: dict, resume: str) -> dict:
+    items = data.get('requirements')
+    if not isinstance(items, list):
+        raise ReviewError('The evidence analyst did not return a requirements table.')
+    expected = {r['id']: r for r in requirements['requirements']}
+    found = {}
+    downgraded = 0
+    for item in items:
+        if not isinstance(item, dict):
+            raise ReviewError('The evidence analyst returned an invalid row.')
+        ident, status = item.get('id'), item.get('status')
+        if (not isinstance(ident, str) or ident not in expected or ident in found
+                or status not in ('Matched', 'Partial', 'Missing')):
+            raise ReviewError('The evidence analyst changed or duplicated a requirement. Please try again.')
+        quote = source_quote(str(item.get('evidence', '')), resume)
+        if status != 'Missing' and not quote:
+            downgraded += 1
+            status = 'Missing'
+        # Names, priorities and job quotes come from the validated job analyst,
+        # so neither the evidence analyst nor coach can rewrite the score inputs.
+        row = dict(expected[ident])
+        row.update(status=status, evidence=quote if status != 'Missing' else 'Not found in resume')
+        found[ident] = row
+    if set(found) != set(expected):
+        raise ReviewError('The evidence analyst omitted a requirement. Please try again.')
+    return {'requirements': [found[r['id']] for r in requirements['requirements']],
+            'downgraded': downgraded}
+
+
+def _rate_limited_llm_call(llm):
+    """Retry only the failing LLM call, rather than restarting earlier agents."""
+    original = llm.call
+
+    @wraps(original)
+    def call_with_backoff(messages, *args, **kwargs):
+        for attempt in range(3):
+            try:
+                return original(messages, *args, **kwargs)
+            except Exception as exc:
+                if error_kind(exc) != 'rate' or attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+    llm.call = call_with_backoff
+    return llm
+
+
+def build_detailed_crew(resume: str, job: str, api_key: str, model_name: str):
+    from crewai import Agent, Crew, LLM, Process, Task
+
+    state = {}
+
+    def detailed_agent(role, goal, tokens):
+        options = {'reasoning_effort': 'low'} if model_name in (
+            'openai/gpt-oss-120b', 'openai/gpt-oss-20b') else {}
+        llm = LLM(model=f'groq/{model_name}', api_key=api_key, temperature=0.2,
+                  max_tokens=tokens, timeout=90, max_retries=0, **options)
+        llm = _rate_limited_llm_call(apply_groq_compat(llm))
+        return Agent(role=role, goal=goal, backstory=f'You are a factual reviewer. {RULES}',
+                     llm=llm, verbose=False, allow_delegation=False, tools=[],
+                     max_iter=2, max_retry_limit=0)
+
+    def gate(stage, required, validator):
+        def validate(output):
+            try:
+                clean = validator(parse_output(output, required))
+                state[stage] = clean
+                # CrewAI guardrails replace raw output with this validated JSON.
+                return True, json.dumps(clean)
+            except ReviewError as exc:
+                state['validation_error'] = ReviewError(
+                    f'Detailed review stopped at {stage}: {exc}', exc.technical_type)
+                return False, str(exc)
+        return validate
+
+    analyst = detailed_agent('Job Requirements Analyst',
+                             'Extract only explicit job requirements and keywords', 4500)
+    evidence = detailed_agent('Resume Evidence Analyst',
+                              'Compare every requirement to exact resume quotations', 6000)
+    coach = detailed_agent('Career Coach', 'Write grounded, prioritized resume improvements', 4500)
+    job_schema = {'requirements': [
+        {'id': 'R1', 'requirement': 'short requirement', 'priority': 'Must-have',
+         'category': 'Skill', 'job_evidence': 'verbatim job quote'}], 'keywords': ['job keyword']}
+    evidence_schema = {'requirements': [
+        {'id': 'R1', 'status': 'Matched', 'evidence': 'verbatim resume quote'}]}
+    coach_schema = {key: value for key, value in SCHEMA.items() if key != 'requirements'}
+    json_rules = ('Return ONLY one complete JSON object. Escape double quotes and newlines '
+                  'inside strings. No Markdown fences, commentary or partial JSON. ')
+    job_task = Task(
+        agent=analyst,
+        description=(f'{RULES}\n{json_rules}Extract must-have skills, nice-to-have skills, '
+                     'experience level, education, certifications, and important keywords. '
+                     'Use only requirements explicitly stated in the job. Do not create a '
+                     'requirement for an unspecified category. Preserve alternatives within '
+                     'one requirement; do not turn A OR B into two mandatory requirements. '
+                     'Use unique IDs R1, R2, etc. Categories: Skill, Experience, Education, '
+                     'Certification, Other. Priorities: Must-have or Nice-to-have. '
+                     'At most 30 distinct requirements, each with an exact job quote. '
+                     f'Shape: {json.dumps(job_schema)}\nJOB DATA:\n<job>\n{job}\n</job>'),
+        expected_output='A complete JSON requirements object with source quotes and keywords.',
+        guardrail=gate('job requirements', {'requirements', 'keywords'},
+                       lambda data: _validated_requirements(data, job)),
+        guardrail_max_retries=0,
+    )
+    evidence_task = Task(
+        agent=evidence, context=[job_task],
+        description=(f'{RULES}\n{json_rules}Use EVERY ID from the validated job requirements '
+                     'in the context, exactly once. Do not invent, delete or duplicate IDs. '
+                     'Classify Matched, Partial, or Missing. Matched requires full supporting '
+                     'resume evidence; Partial means the resume supports only part of the '
+                     'requirement. Quote resume text exactly for Matched and Partial; '
+                     'otherwise write Not found in resume. Do not infer unlisted degrees '
+                     'or certifications from job titles. Do not calculate a score. '
+                     f'Shape: {json.dumps(evidence_schema)}\nRESUME DATA:\n<resume>\n{resume}\n</resume>'),
+        expected_output='Complete JSON containing one evidence assessment for each requirement ID.',
+        guardrail=gate('resume evidence', {'requirements'},
+                       lambda data: _validated_evidence(data, state['job requirements'], resume)),
+        guardrail_max_retries=0,
+    )
+
+    def validate_coach(data):
+        for field in ('recommendations', 'rewrites', 'ats_keywords'):
+            if not isinstance(data.get(field), list):
+                raise ReviewError(f'The coach returned an invalid {field} section.')
+        # Discard any attempted replacement of requirements or a model-made score.
+        return {key: data[key] for key in ('recommendations', 'rewrites', 'ats_keywords')}
+
+    coach_task = Task(
+        agent=coach, context=[job_task, evidence_task],
+        description=(f'{RULES}\n{json_rules}Use the validated requirements and evidence in '
+                     'the context. Write at most 6 specific High/Medium/Low actions, '
+                     '3 Before/After bullet rewrites, and 10 ATS keywords. Prioritize '
+                     'Must-have gaps. Do not change requirement IDs, priorities, evidence '
+                     'or statuses. Do not calculate a score. Before bullets must appear '
+                     'verbatim in the resume; After bullets must retain those same facts '
+                     'and must not borrow a metric from another bullet. Missing skills '
+                     'must remain conditional. Keywords must be from the job requirements. '
+                     f'Shape: {json.dumps(coach_schema)}\nRESUME DATA:\n<resume>\n{resume}\n</resume>'),
+        expected_output='Complete JSON containing prioritized recommendations, rewrites and ATS keywords.',
+        guardrail=gate('career coaching', {'recommendations', 'rewrites', 'ats_keywords'}, validate_coach),
+        guardrail_max_retries=0,
+    )
+    crew = Crew(agents=[analyst, evidence, coach], tasks=[job_task, evidence_task, coach_task],
+                process=Process.sequential, memory=False, planning=False, cache=False,
+                verbose=False, share_crew=False, tracing=False)
+    return crew, state
+
+
+def review_detailed(resume: str, job: str, api_key: str, model_name: str) -> dict:
+    from inputs import validate_text
+    if validate_text(resume, job):
+        raise ReviewError('Both inputs must contain at least 100 characters.')
+    if not api_key.strip():
+        raise ReviewError('GROQ_API_KEY is empty. Add your Groq key in secrets.')
+    state = {}
+    try:
+        crew, state = build_detailed_crew(resume, job, api_key, model_name)
+        crew.kickoff()
+        if 'validation_error' in state:
+            raise state['validation_error']
+        if not all(key in state for key in ('job requirements', 'resume evidence', 'career coaching')):
+            raise ReviewError('Detailed review did not finish all three stages. Please try again.')
+        data = dict(state['career coaching'])
+        data['requirements'] = state['resume evidence']['requirements']
+        result = render_report(data, resume, job)
+        changed = state['resume evidence']['downgraded']
+        if changed:
+            result['markdown'] += (f'\n\nDetailed validation note: {changed} unsupported '
+                                   'resume evidence claims were changed to Missing.')
+        return result
+    except ReviewError:
+        raise
+    except Exception as exc:
+        if 'validation_error' in state:
+            raise state['validation_error'] from None
+        messages = {
+            'rate': 'Groq rate limit reached during Detailed review. Wait a minute or switch to Quick mode.',
+            'key': 'Groq rejected the API key. Check GROQ_API_KEY in secrets.',
+            'model': 'The Groq model is unavailable. Update GROQ_MODEL in secrets.',
+            'context': 'The model context is full. Shorten the resume or job description.',
+            'timeout': 'Groq timed out during Detailed review. Please try again.',
+            'connection': 'Could not connect to Groq. Please try again.',
+            'other': 'Detailed review could not finish. Please try again.',
+        }
+        raise ReviewError(messages[error_kind(exc)], type(exc).__name__) from None

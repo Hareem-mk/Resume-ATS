@@ -1,4 +1,4 @@
-"""Resume Review Agent — Stage 2: prepared inputs and one-agent Quick review."""
+"""Resume Review Agent — Stage 3: Quick and Detailed resume review."""
 from __future__ import annotations
 
 from runtime import configure_runtime
@@ -11,7 +11,7 @@ from inputs import (
     MAX_RESUME_CHARS, MAX_JOB_CHARS, extract_pdf_text, extract_docx_text,
     validate_text, trim_text,
 )
-from review import ReviewError, review_quick
+from review import ReviewError, review_quick, review_detailed
 
 st.set_page_config(page_title='Resume Review Agent', page_icon='📄')
 
@@ -46,7 +46,7 @@ st.markdown("<div style='position:fixed;top:3.5rem;right:1.5rem;z-index:999;"
             "font-weight:800;font-size:1.4rem;pointer-events:none'>MKU</div>",
             unsafe_allow_html=True)
 st.title('Resume Review Agent')
-st.caption('Stage 2 · Quick review with one CrewAI agent. Detailed mode comes next.')
+st.caption('Quick review or Detailed review with three agents working in sequence.')
 st.info('Prepare and check the text first. Analyze Resume sends the prepared text to Groq.')
 st.caption('Inputs stay in server/session memory and are not saved to disk. '
            'Remove unnecessary personal details before analysis.')
@@ -139,12 +139,19 @@ if prepared:
 else:
     st.caption('Prepare valid inputs to enable Analyze Resume.')
 
+mode = st.radio('Review mode', ['Quick', 'Detailed'], horizontal=True, key='review_mode')
+st.caption('Quick uses one agent. Detailed uses three sequential agents and uses more tokens.')
+if st.session_state.get('review_result_mode') != mode:
+    st.session_state.pop('review_result', None)
+
 if st.button('Analyze Resume', disabled=prepared is None or bool(problems), key='analyze'):
     st.session_state.pop('review_result', None)
     try:
         api_key, model_name = get_llm_settings()
-        with st.spinner('Checking requirements and resume evidence. Please wait…'):
-            st.session_state['review_result'] = review_quick(*prepared, api_key, model_name)
+        with st.spinner(f'{mode} review: checking requirements and resume evidence. Please wait…'):
+            reviewer = review_detailed if mode == 'Detailed' else review_quick
+            st.session_state['review_result'] = reviewer(*prepared, api_key, model_name)
+            st.session_state['review_result_mode'] = mode
     except ReviewError as exc:
         st.error(str(exc))
         if exc.technical_type:
@@ -157,6 +164,7 @@ if st.button('Analyze Resume', disabled=prepared is None or bool(problems), key=
 
 result = st.session_state.get('review_result')
 if result:
+    st.caption(f'{mode} review completed')
     st.metric('Estimated match', f"{result['score']}/100")
     st.markdown(result['markdown'])
     st.download_button('Download report', result['markdown'], 'resume_review.md', 'text/markdown')

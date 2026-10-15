@@ -50,34 +50,74 @@ st.caption('Stage 2 · Quick review with one CrewAI agent. Detailed mode comes n
 st.info('Prepare and check the text first. Analyze Resume sends the prepared text to Groq.')
 st.caption('Inputs stay in server/session memory and are not saved to disk. '
            'Remove unnecessary personal details before analysis.')
-paste_tab, pdf_tab = st.tabs(['Paste text', 'Upload PDF or DOCX'])
-with paste_tab:
-    pasted_resume = st.text_area('Resume text', height=240, key='pasted_resume',
-                                placeholder='Paste your resume here')
-with pdf_tab:
-    uploaded = st.file_uploader('PDF or DOCX (5 MB; PDFs: 20 pages maximum)',
-                               type=['pdf', 'docx'], max_upload_size=5, key='resume_upload')
-source = st.radio('Resume source to prepare', ['Paste text', 'Upload PDF or DOCX'], horizontal=True)
-file_error = None
-resume = pasted_resume if source == 'Paste text' else ''
-if source == 'Upload PDF or DOCX' and uploaded is not None:
-    try:
-        extractor = extract_docx_text if uploaded.name.lower().endswith('.docx') else extract_pdf_text
-        resume = extractor(uploaded.getvalue())
-        st.success(f'Extracted {len(resume):,} characters from the file.')
-    except ValueError as exc:
-        file_error = str(exc)
-        st.error(file_error)
-job = st.text_area('Job description', height=220, key='job_description')
+# One source selector controls exactly which input is displayed and read.
+def read_uploaded_text(upload, label: str) -> str:
+    if upload.name.lower().endswith('.docx'):
+        return extract_docx_text(upload.getvalue())
+    if upload.name.lower().endswith('.pdf'):
+        return extract_pdf_text(upload.getvalue())
+    raise ValueError(f'{label}: choose a PDF or DOCX file.')
+
+
+def reset_session():
+    generation = st.session_state.get('upload_generation', 0) + 1
+    st.session_state.clear()
+    st.session_state['upload_generation'] = generation
+
+
+st.caption('To paste: click inside a text box, press ⌘+V on Mac or Ctrl+V on Windows, '
+           'then click outside the box to apply the text.')
+generation = st.session_state.get('upload_generation', 0)
+file_errors = []
+st.subheader('1. Resume')
+source = st.radio('Resume input method', ['Paste text', 'Upload PDF or DOCX'],
+                  horizontal=True, key='resume_source')
+resume = ''
+if source == 'Paste text':
+    resume = st.text_area('Resume text', height=240, key='pasted_resume',
+                          placeholder='Click here, then paste your resume.')
+else:
+    uploaded = st.file_uploader('Upload resume (5 MB; PDFs: 20 pages maximum)',
+                               type=['pdf', 'docx'], max_upload_size=5,
+                               key=f'resume_upload_{generation}')
+    if uploaded is None:
+        file_errors.append('Upload a resume file or choose Paste text.')
+    else:
+        try:
+            resume = read_uploaded_text(uploaded, 'Resume')
+            st.success(f'Resume file read: {len(resume):,} characters.')
+        except ValueError as exc:
+            file_errors.append(str(exc))
+            st.error(str(exc))
+st.caption(f'Resume text received: {len(resume.strip()):,} characters.')
+
+st.subheader('2. Job description')
+job_source = st.radio('Job-description input method', ['Paste text', 'Upload PDF or DOCX'],
+                      horizontal=True, key='job_source')
+job = ''
+if job_source == 'Paste text':
+    job = st.text_area('Job description', height=220, key='job_description',
+                       placeholder='Click here, then paste the full job description.')
+else:
+    job_file = st.file_uploader('Upload job description (5 MB; PDFs: 20 pages maximum)',
+                               type=['pdf', 'docx'], max_upload_size=5,
+                               key=f'job_upload_{generation}')
+    if job_file is None:
+        file_errors.append('Upload a job-description file or choose Paste text.')
+    else:
+        try:
+            job = read_uploaded_text(job_file, 'Job description')
+            st.success(f'Job-description file read: {len(job):,} characters.')
+        except ValueError as exc:
+            file_errors.append(str(exc))
+            st.error(str(exc))
+st.caption(f'Job-description text received: {len(job.strip()):,} characters.')
 problems = validate_text(resume, job)
-if source == 'Upload PDF or DOCX' and uploaded is None:
-    problems.insert(0, 'Upload a PDF/DOCX or choose Paste text.')
-if file_error:
-    problems.insert(0, file_error)
+problems = file_errors + problems
 if problems:
     st.warning('To prepare inputs, complete both fields. ' + ' '.join(problems))
 
-fingerprint = hashlib.sha256((source + '\0' + resume + '\0' + job).encode()).hexdigest()
+fingerprint = hashlib.sha256((source + '\0' + job_source + '\0' + resume + '\0' + job).encode()).hexdigest()
 if st.session_state.get('prepared_fingerprint') != fingerprint:
     st.session_state.pop('prepared_inputs', None)
     st.session_state.pop('review_result', None)
@@ -120,6 +160,4 @@ if result:
     st.metric('Estimated match', f"{result['score']}/100")
     st.markdown(result['markdown'])
     st.download_button('Download report', result['markdown'], 'resume_review.md', 'text/markdown')
-if st.button('Start over', key='start_over'):
-    st.session_state.clear()
-    st.rerun()
+st.button('Start over', key='start_over', on_click=reset_session)

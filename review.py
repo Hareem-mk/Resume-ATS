@@ -41,7 +41,7 @@ def build_quick_crew(resume: str, job: str, api_key: str, model_name: str):
     from crewai import Agent, Crew, LLM, Process, Task
 
     llm = LLM(model=f"groq/{model_name}", api_key=api_key, temperature=0.2,
-              max_tokens=4000, timeout=90, max_retries=0)
+              max_tokens=4000, timeout=90, max_retries=0) llm = apply_groq_compat(llm)
     reviewer = Agent(
         role="Resume Review Specialist",
         goal="Extract job requirements, check resume evidence, and give factual advice",
